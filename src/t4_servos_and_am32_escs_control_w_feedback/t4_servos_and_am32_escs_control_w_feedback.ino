@@ -93,7 +93,7 @@ uint16_t serial_act_t4_buf_in_cnt = 0;
 
 uint8_t serial_act_t4_msg_buf_in[2 * sizeof(struct serial_act_t4_in)] = { 0 };
 int serial_act_t4_received_packets = 0;
-elapsedMillis old_time_frequency_in = 0, time_no_connection_flightcontroller = 0;
+elapsedMillis old_time_frequency_in = 0, time_no_connection_flightcontroller = 0, restart_esc_0;
 uint16_t serial_act_t4_message_frequency_in;
 int serial_act_t4_missed_packets_in;
 
@@ -532,9 +532,17 @@ void GenerateCommands(void){
   //DEBUG_serial.println(Target_position_servo_1);
 
   if(ESC_1_arm){
-    ESCCMD_throttle(0, constrain(myserial_act_t4_in.esc_1_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+    //Check if ESC telemetry has some errors, if so try to disarm and rearm the ESC
+    if(myserial_act_t4_out.esc_1_error_code_int < 0 && restart_esc_0 < COMMON_TMR)
+    {
+      ESCCMD_throttle(0, 0);
+    }
+    else{
+      ESCCMD_throttle(0, constrain(myserial_act_t4_in.esc_1_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      restart_esc_0 = 0;
+    }
   } 
-  else {
+  else{
     ESCCMD_stop(0);
   }
 
