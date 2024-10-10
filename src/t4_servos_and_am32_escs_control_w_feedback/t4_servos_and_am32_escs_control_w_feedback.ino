@@ -26,7 +26,7 @@
 #include "Definitions_SxS.h"
 
 /* ONLY enable the line(s) if you are debugging your code, no need otherwise */
-//#define INCLUDE_DEBUGCODE 0
+#define INCLUDE_DEBUGCODE 0
 //#define VERBOSE_MESSAGE
 
 /* ONLY uncomment one of the next lines to test the motors running and servos moving without a flightcontroller */
@@ -56,7 +56,7 @@
 #define ESCPID_NB_ESC 4   // Number of ESCs
 #define ESCPID_MAX_ESC 4  // Max number of ESCs
 
-#define MIN_DSHOT_CMD 100
+#define MIN_DSHOT_CMD 0
 #define MAX_DSHOT_CMD 1999
 
 /* -------------------------- SERVOS DEFINED VARIABLES --------------------------------- */
@@ -120,6 +120,9 @@ int servo_1_is_SCS, servo_2_is_SCS, servo_3_is_SCS, servo_4_is_SCS, servo_5_is_S
 
 elapsedMicros last_time_write_read_servo_cnt = 0;
 int ack_write_read = 0;
+
+int restart_esc_0_bool = 0;
+
 
 float servo_1_max_command = SERVO_MAX_COMD_DEFAULT; 
 float servo_2_max_command = SERVO_MAX_COMD_DEFAULT;
@@ -279,7 +282,7 @@ void loop(void) {
     //  DisplayEscCurrent();
     //  DisplayEscRpm();
     //  DisplayEscErr();
-    //  DisplayEscCmd();
+      DisplayEscCmd();
     //  DebugServoLostFeedbackPackets();
     //  DebugUpdateTimePosPackets();
     //  DebugServoLostAckPackets();
@@ -533,14 +536,21 @@ void GenerateCommands(void){
 
   if(ESC_1_arm){
     //Check if ESC telemetry has some errors, if so try to disarm and rearm the ESC
-    if(myserial_act_t4_out.esc_1_error_code_int < 0 && restart_esc_0 < COMMON_TMR)
+    if(myserial_act_t4_out.esc_1_error_code_int < -9 || restart_esc_0_bool)
     {
-      ESCCMD_throttle(0, 0);
+      ESCCMD_stop(0);
+      restart_esc_0_bool = 1;
     }
     else{
       ESCCMD_throttle(0, constrain(myserial_act_t4_in.esc_1_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      restart_esc_0_bool = 0;
       restart_esc_0 = 0;
     }
+
+    if(restart_esc_0 > 3000){
+      restart_esc_0_bool = 0;
+    }
+//    ESCCMD_throttle(0, constrain(myserial_act_t4_in.esc_1_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
   } 
   else{
     ESCCMD_stop(0);
