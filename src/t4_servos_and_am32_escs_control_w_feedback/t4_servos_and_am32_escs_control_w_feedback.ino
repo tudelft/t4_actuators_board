@@ -18,6 +18,8 @@
   Indeed surprisingly we only have 24H a day also, and  all the copy/paste repeated code is not super, but it works.
   Even as it is a working solution, would be great if you help to make it better wherever possible.
 
+  Before flashing on the T4 Actuators Board one needs to set Teensy 4 settings to "CPU Speed"= "816MHz ( Overclock)", and "Optimize"="Fastest"
+
 */
 
 #include <stdint.h>
@@ -25,8 +27,8 @@
 #include "ESCCMD.h"
 #include "Definitions_SxS.h"
 
-/* ONLY enable the line(s) if you are debugging your code, no need otherwise */
-//#define INCLUDE_DEBUGCODE 0
+/* ONLY uncomment these line(s) if you are debugging your code, NO need otherwise */
+//#define INCLUDE_DEBUGCODE
 //#define VERBOSE_MESSAGE
 
 /* ONLY uncomment one of the next lines to test the motors running and servos moving without a flightcontroller */
@@ -56,9 +58,10 @@
 #define ESCPID_NB_ESC 4   // Number of ESCs
 #define ESCPID_MAX_ESC 4  // Max number of ESCs
 
-#define MIN_DSHOT_CMD 100
+#define MIN_DSHOT_CMD 0
 #define MAX_DSHOT_CMD 1999
 
+#define ESC_RESET_TIMER 3000 // [ms] Time to wait before sending the first command to the ESCs
 /* -------------------------- SERVOS DEFINED VARIABLES --------------------------------- */
 
 /* PWM servos settings and declarations used for PWM based servo 11 and 12 */
@@ -69,40 +72,41 @@
 /* SERIAL BUS servos default settings 
    NOTE: The Rx and Tx pins at the Teensy must be tied together and connected via ~150 Ohm to the FEETECH data line! */
 #define BAUDRATE_SERVO 1000000  // Baudrate for the servo communication
-#define SERVO_MAX_COMD_DEFAULT 4095     // It tells us the step we use to control the servo angle for STS type of servos
-#define SERVO_MAX_COMD_DEFAULT_SCS 1023 // It tells us the step we use to control the servo angle for SCS type of servos
-#define DEFAULT_STEPS_FOR_FULL_ROTATION 4095
-#define DEFAULT_STEPS_FOR_FULL_ROTATION_SCS 1023
-#define DEFAULT_MULTIPLIER_DEGREES 100
+#define SERVO_MAX_COMD_DEFAULT 4095     // It defines the step we want to use to control the servo angle for STS type of servos
+#define SERVO_MAX_COMD_DEFAULT_SCS 1023 // For SCS type of servos it defines the step we want to use to control the servo angle
+#define DEFAULT_STEPS_FOR_FULL_ROTATION 4095 // It defines the steps for a full rotation for STS type of servos
+#define DEFAULT_STEPS_FOR_FULL_ROTATION_SCS 1023 // For SCS type of servos
+#define DEFAULT_MULTIPLIER_DEGREES 100  // Multiplier for the degrees to be sent to the servos
 #define SERVO_COMM_MARGIN_DEFAULT 80    // [uS] Margin of time given to the servo for the response [20] opti = 80 [100]
 #define TIME_OF_SERVO_TX_DEFAULT 20     // [uS] Margin of time needed to avoid TX conflicts when the servos are killed [10] opti = 20 [50]
 
 /* ---------------------------- LET'S GET DOWN TO IT ----------------------------------- */
-byte START_BYTE_SERIAL_ACT_T4 = 0x9A;
+byte START_BYTE_ACTUATORS_T4 = 0x9A;
 elapsedMicros last_time_write_to_flightcontroller = 0;
 int ack_comm_TX_flightcontroller = 0;
 
-struct serial_act_t4_in myserial_act_t4_in;
-volatile struct serial_act_t4_out myserial_act_t4_out;
-volatile struct serial_act_t4_internal myserial_act_t4_internal;
+struct ActuatorsT4In actuators_t4_in;
+volatile struct ActuatorsT4Out actuators_t4_out;
+volatile struct ActuatorsT4Local actuators_t4_local;
 volatile float extra_data_in[255], extra_data_out[255] __attribute__((aligned));
 
 uint8_t rolling_message_out_id_cnt = 0;
 
-uint16_t serial_act_t4_buf_in_cnt = 0;
+uint16_t actuators_t4_buf_in_cnt = 0;
 
-uint8_t serial_act_t4_msg_buf_in[2 * sizeof(struct serial_act_t4_in)] = { 0 };
-int serial_act_t4_received_packets = 0;
-elapsedMillis old_time_frequency_in = 0, time_no_connection_flightcontroller = 0, restart_esc_0;
-uint16_t serial_act_t4_message_frequency_in;
-int serial_act_t4_missed_packets_in;
+uint8_t actuators_t4_msg_buf_in[2 * sizeof(struct ActuatorsT4In)] = { 0 };
+int actuators_t4_received_packets = 0;
+elapsedMillis old_time_frequency_in = 0, time_no_connection_flightcontroller = 0, esc_1_restart_ctmr, esc_2_restart_ctmr, esc_3_restart_ctmr, esc_4_restart_ctmr;
+uint16_t actuators_t4_message_frequency_in;
+int actuators_t4_missed_packets_in;
 
 float comm_refresh_time, comm_refresh_frequency;
 
 int Servo_1_arm, Servo_2_arm, Servo_3_arm, Servo_4_arm, Servo_5_arm, Servo_6_arm, Servo_7_arm, Servo_8_arm, Servo_9_arm, Servo_10_arm;
-int Servo_11_arm, Servo_12_arm;// PWM servos
+int Servo_11_arm, Servo_12_arm;// PWM servos (Or PWM based ESCs) 
 
 int ESC_1_arm, ESC_2_arm, ESC_3_arm, ESC_4_arm;
+bool do_restart_esc_1 = false, do_restart_esc_2 = false , do_restart_esc_3 = false, do_restart_esc_4 = false;
 
 float PWM_to_pulse_multiplier;
 float servo_11_state_memory[SERVO_STATE_MEM_BUF_SIZE], servo_12_state_memory[SERVO_STATE_MEM_BUF_SIZE];
@@ -273,13 +277,13 @@ void loop(void) {
   /* ONLY enable those functions for debugging purposes! One can enable multiple functions at the same time. 
      The #ifdef INCLUDE_DEBUGCODE must be enabled at the top of the code.
      Note that it can have an actuators response performance impact, so use wisely. */
-  if (timer_count_main > COMMON_TMR) {  // 200 Hz loop
+  if (timer_count_main > COMMON_TMR) {  /* 200 Hz loop */
     #ifdef INCLUDE_DEBUGCODE                       
     //  DisplayEscVoltage();
     //  DisplayEscCurrent();
     //  DisplayEscRpm();
     //  DisplayEscErr();
-    //  DisplayEscCmd();
+      DisplayEscCmd(); /* for example to debug only ESC COMMANDs then uncomment this line */
     //  DebugServoLostFeedbackPackets();
     //  DebugUpdateTimePosPackets();
     //  DebugServoLostAckPackets();
@@ -299,13 +303,13 @@ void loop(void) {
 #ifdef INCLUDE_DEBUGCODE
 void DebugReceivedCmdESCs(void) {
   DEBUG_serial.print("ESC_1_cmd_dshot:");
-  DEBUG_serial.print(myserial_act_t4_in.esc_1_dshot_cmd_int);
+  DEBUG_serial.print(actuators_t4_in.esc_1_dshot_cmd);
   DEBUG_serial.print("ESC_2_cmd_dshot:");
-  DEBUG_serial.print(myserial_act_t4_in.esc_2_dshot_cmd_int);
+  DEBUG_serial.print(actuators_t4_in.esc_2_dshot_cmd);
   DEBUG_serial.print("ESC_3_cmd_dshot:");
-  DEBUG_serial.print(myserial_act_t4_in.esc_3_dshot_cmd_int);
+  DEBUG_serial.print(actuators_t4_in.esc_3_dshot_cmd);
   DEBUG_serial.print("ESC_4_cmd_dshot:");
-  DEBUG_serial.println(myserial_act_t4_in.esc_4_dshot_cmd_int);
+  DEBUG_serial.println(actuators_t4_in.esc_4_dshot_cmd);
 }
 #endif
 
@@ -313,42 +317,45 @@ void GenerateCommands(void){
 
   #ifdef TEST_MOTORS 
   #warning "TEST_MOTORS is defined, Motors via ESCs will be run tested, do not use in stable product releases!"
-  myserial_act_t4_in.esc_arm_int = 0;
-  bitSet(myserial_act_t4_in.esc_arm_int, 0); //ESC 1 - comment to kill 
-  bitSet(myserial_act_t4_in.esc_arm_int, 1); //ESC 2 - comment to kill
-  bitSet(myserial_act_t4_in.esc_arm_int, 2); //ESC 3 - comment to kill
-  bitSet(myserial_act_t4_in.esc_arm_int, 3); //ESC 4 - comment to kill
+  actuators_t4_in.esc_arm = 0;
+  bitSet(actuators_t4_in.esc_arm, 0); //ESC 1 - comment to kill 
+  bitSet(actuators_t4_in.esc_arm, 1); //ESC 2 - comment to kill
+  bitSet(actuators_t4_in.esc_arm, 2); //ESC 3 - comment to kill
+  bitSet(actuators_t4_in.esc_arm, 3); //ESC 4 - comment to kill
   time_no_connection_flightcontroller = 0;
-  myserial_act_t4_in.esc_1_dshot_cmd_int = 600;
-  myserial_act_t4_in.esc_2_dshot_cmd_int = 700;
-  myserial_act_t4_in.esc_3_dshot_cmd_int = 800;
-  myserial_act_t4_in.esc_4_dshot_cmd_int = 900;
+  actuators_t4_in.esc_1_dshot_cmd = 600;
+  actuators_t4_in.esc_2_dshot_cmd = 700;
+  actuators_t4_in.esc_3_dshot_cmd = 800;
+  actuators_t4_in.esc_4_dshot_cmd = 900;
   #endif
 
   #ifdef TEST_SERVOS
   #warning "TEST_SERVOS is defined, servos will be tested, do not use in stable product releases!"
-  myserial_act_t4_in.servo_arm_int = 0;
-  bitSet(myserial_act_t4_in.servo_arm_int, 0); //Servo 1 - comment to kill
-  bitSet(myserial_act_t4_in.servo_arm_int, 1); //Servo 2 - comment to kill
-  bitSet(myserial_act_t4_in.servo_arm_int, 2); //Servo 3 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 3); //Servo 4 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 4); //Servo 5 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 5); //Servo 6 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 6); //Servo 7 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 7); //Servo 8 - comment to kill
-  bitSet(myserial_act_t4_in.servo_arm_int, 8); //Servo 9 - comment to kill 
-  bitSet(myserial_act_t4_in.servo_arm_int, 9); //Servo 10 - comment to kill 
+  actuators_t4_in.servo_arm = 0;
+  bitSet(actuators_t4_in.servo_arm, 0); //Servo 1 - comment to kill
+  bitSet(actuators_t4_in.servo_arm, 1); //Servo 2 - comment to kill
+  bitSet(actuators_t4_in.servo_arm, 2); //Servo 3 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 3); //Servo 4 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 4); //Servo 5 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 5); //Servo 6 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 6); //Servo 7 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 7); //Servo 8 - comment to kill
+  bitSet(actuators_t4_in.servo_arm, 8); //Servo 9 - comment to kill 
+  bitSet(actuators_t4_in.servo_arm, 9); //Servo 10 - comment to kill
+
   time_no_connection_flightcontroller = 0;
-  myserial_act_t4_in.servo_1_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_2_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_3_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_4_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_5_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_6_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_7_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_8_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_9_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
-  myserial_act_t4_in.servo_10_cmd_int = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+
+  //TODO: Define the sin once and use it for all servos
+  actuators_t4_in.servo_1_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_2_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_3_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_4_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_5_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_6_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_7_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_8_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_9_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
+  actuators_t4_in.servo_10_cmd = 60*degrees_accuracy_multiplier*sin(2*PI*0.1*millis()/1000);
   // servo_1_is_SCS = 1;  // Enabled only for testing FeeTech SCS types of servos instead of STS types
   #endif
 
@@ -359,18 +366,18 @@ void GenerateCommands(void){
   /* Correct in case we have sent a extra_data_in made up of zeros: */
   if (fabs(SERVO_11_FIRST_ORD_DYN_DEN < 1e-5)) SERVO_11_FIRST_ORD_DYN_DEN = -0.9802; // Magic number bonus ;-)
   if (fabs(SERVO_12_FIRST_ORD_DYN_NUM < 1e-5)) SERVO_12_FIRST_ORD_DYN_NUM = 0.0198;
-  if (SERVO_11_MAX_PWM < .1) SERVO_11_MAX_PWM = 1900;   // Yeah, if it does not suit your scenario change at will...
-  if (SERVO_11_MIN_PWM < .1) SERVO_11_MIN_PWM = 1100;   //Ditto
-  if (SERVO_11_ZERO_PWM < .1) SERVO_11_ZERO_PWM = 1500; //...indeed.
+  if (SERVO_11_MAX_PWM < .1) SERVO_11_MAX_PWM = 1900;   // Yeah, if it does not suit your scenario, change at will...
+  if (SERVO_11_MIN_PWM < .1) SERVO_11_MIN_PWM = 1100;   // Ditto
+  if (SERVO_11_ZERO_PWM < .1) SERVO_11_ZERO_PWM = 1500; // ...indeed, also change at will....
   if (fabs(SERVO_11_MIN_ANGLE_DEG) < .1) SERVO_11_MIN_ANGLE_DEG = -60;
   if (fabs(SERVO_11_MAX_ANGLE_DEG) < .1) SERVO_11_MAX_ANGLE_DEG = 60;
   if((float)SERVO_11_DELAY_TS < .1) SERVO_11_DELAY_TS = 5;
 
   if (fabs(SERVO_12_FIRST_ORD_DYN_DEN < 1e-5)) SERVO_12_FIRST_ORD_DYN_DEN = -0.9802;
   if (fabs(SERVO_12_FIRST_ORD_DYN_NUM < 1e-5)) SERVO_12_FIRST_ORD_DYN_NUM = 0.0198;
-  if (SERVO_12_MAX_PWM < .1) SERVO_12_MAX_PWM = 1900; // Yeah, if it does not suit your scenario change at will...
+  if (SERVO_12_MAX_PWM < .1) SERVO_12_MAX_PWM = 1900; // Yeah, if it does not suit your scenario, change at will...
   if (SERVO_12_MIN_PWM < .1) SERVO_12_MIN_PWM = 1100; // Ditto
-  if (SERVO_12_ZERO_PWM < .1) SERVO_12_ZERO_PWM = 1500; //...indeed.
+  if (SERVO_12_ZERO_PWM < .1) SERVO_12_ZERO_PWM = 1500; // ...indeed, also change at will....
   if (fabs(SERVO_12_MIN_ANGLE_DEG) < .1) SERVO_12_MIN_ANGLE_DEG = -60;
   if (fabs(SERVO_12_MAX_ANGLE_DEG) < .1) SERVO_12_MAX_ANGLE_DEG = 60;
   if((float)SERVO_12_DELAY_TS < .1) SERVO_12_DELAY_TS = 5;
@@ -474,25 +481,25 @@ void GenerateCommands(void){
     servo_10_max_command = SERVO_MAX_COMD_DEFAULT_SCS;
   }
 
-  // Extract Servo and ESC arm status from the bitmask in myserial_act_t4_in
+  // Extract Servo and ESC arm status from the bitmask in actuators_t4_in
   if (time_no_connection_flightcontroller < COMMON_TMR) {
-    Servo_1_arm = (myserial_act_t4_in.servo_arm_int & 0x01) >> 0;
-    Servo_2_arm = (myserial_act_t4_in.servo_arm_int & 0x02) >> 1;
-    Servo_3_arm = (myserial_act_t4_in.servo_arm_int & 0x04) >> 2;
-    Servo_4_arm = (myserial_act_t4_in.servo_arm_int & 0x08) >> 3;
-    Servo_5_arm = (myserial_act_t4_in.servo_arm_int & 0x10) >> 4;
-    Servo_6_arm = (myserial_act_t4_in.servo_arm_int & 0x20) >> 5;
-    Servo_7_arm = (myserial_act_t4_in.servo_arm_int & 0x40) >> 6;
-    Servo_8_arm = (myserial_act_t4_in.servo_arm_int & 0x80) >> 7;
-    Servo_9_arm = (myserial_act_t4_in.servo_arm_int & 0x100) >> 8;
-    Servo_10_arm = (myserial_act_t4_in.servo_arm_int & 0x200) >> 9;
-    Servo_11_arm = (myserial_act_t4_in.servo_arm_int & 0x400) >> 10;
-    Servo_12_arm = (myserial_act_t4_in.servo_arm_int & 0x800) >> 11;
+    Servo_1_arm = (actuators_t4_in.servo_arm & 0x01) >> 0;
+    Servo_2_arm = (actuators_t4_in.servo_arm & 0x02) >> 1;
+    Servo_3_arm = (actuators_t4_in.servo_arm & 0x04) >> 2;
+    Servo_4_arm = (actuators_t4_in.servo_arm & 0x08) >> 3;
+    Servo_5_arm = (actuators_t4_in.servo_arm & 0x10) >> 4;
+    Servo_6_arm = (actuators_t4_in.servo_arm & 0x20) >> 5;
+    Servo_7_arm = (actuators_t4_in.servo_arm & 0x40) >> 6;
+    Servo_8_arm = (actuators_t4_in.servo_arm & 0x80) >> 7;
+    Servo_9_arm = (actuators_t4_in.servo_arm & 0x100) >> 8;
+    Servo_10_arm = (actuators_t4_in.servo_arm & 0x200) >> 9;
+    Servo_11_arm = (actuators_t4_in.servo_arm & 0x400) >> 10;
+    Servo_12_arm = (actuators_t4_in.servo_arm & 0x800) >> 11;
 
-    ESC_1_arm = (myserial_act_t4_in.esc_arm_int & 0x01) >> 0;
-    ESC_2_arm = (myserial_act_t4_in.esc_arm_int & 0x02) >> 1;
-    ESC_3_arm = (myserial_act_t4_in.esc_arm_int & 0x04) >> 2;
-    ESC_4_arm = (myserial_act_t4_in.esc_arm_int & 0x08) >> 3;
+    ESC_1_arm = (actuators_t4_in.esc_arm & 0x01) >> 0;
+    ESC_2_arm = (actuators_t4_in.esc_arm & 0x02) >> 1;
+    ESC_3_arm = (actuators_t4_in.esc_arm & 0x04) >> 2;
+    ESC_4_arm = (actuators_t4_in.esc_arm & 0x08) >> 3;
   } 
   else {
     Servo_1_arm = 0; 
@@ -517,29 +524,36 @@ void GenerateCommands(void){
 
   #define FULLROTATION 360
   /* Apply received message to actuators: [servo arming status is managed in the loop automatically, no need for if statement] */
-  Target_position_servo_1 = (int)(constrain(steps_for_full_rotation_servo_1/FULLROTATION * myserial_act_t4_in.servo_1_cmd_int / (degrees_accuracy_multiplier) + (servo_1_max_command / 2.0), 0, servo_1_max_command));
-  Target_position_servo_2 = (int)(constrain(steps_for_full_rotation_servo_2/FULLROTATION * myserial_act_t4_in.servo_2_cmd_int / (degrees_accuracy_multiplier) + (servo_2_max_command / 2.0), 0, servo_2_max_command));
-  Target_position_servo_3 = (int)(constrain(steps_for_full_rotation_servo_3/FULLROTATION * myserial_act_t4_in.servo_3_cmd_int / (degrees_accuracy_multiplier) + (servo_3_max_command / 2.0), 0, servo_3_max_command));
-  Target_position_servo_4 = (int)(constrain(steps_for_full_rotation_servo_4/FULLROTATION * myserial_act_t4_in.servo_4_cmd_int / (degrees_accuracy_multiplier) + (servo_4_max_command / 2.0), 0, servo_4_max_command));
-  Target_position_servo_5 = (int)(constrain(steps_for_full_rotation_servo_5/FULLROTATION * myserial_act_t4_in.servo_5_cmd_int / (degrees_accuracy_multiplier) + (servo_5_max_command / 2.0), 0, servo_5_max_command));
-  Target_position_servo_6 = (int)(constrain(steps_for_full_rotation_servo_6/FULLROTATION * myserial_act_t4_in.servo_6_cmd_int / (degrees_accuracy_multiplier) + (servo_6_max_command / 2.0), 0, servo_6_max_command));
-  Target_position_servo_7 = (int)(constrain(steps_for_full_rotation_servo_7/FULLROTATION * myserial_act_t4_in.servo_7_cmd_int / (degrees_accuracy_multiplier) + (servo_7_max_command / 2.0), 0, servo_7_max_command));
-  Target_position_servo_8 = (int)(constrain(steps_for_full_rotation_servo_8/FULLROTATION * myserial_act_t4_in.servo_8_cmd_int / (degrees_accuracy_multiplier) + (servo_8_max_command / 2.0), 0, servo_8_max_command));
-  Target_position_servo_9 = (int)(constrain(steps_for_full_rotation_servo_9/FULLROTATION * myserial_act_t4_in.servo_9_cmd_int / (degrees_accuracy_multiplier) + (servo_9_max_command / 2.0), 0, servo_9_max_command));
-  Target_position_servo_10 = (int)(constrain(steps_for_full_rotation_servo_10/FULLROTATION * myserial_act_t4_in.servo_10_cmd_int / (degrees_accuracy_multiplier) + (servo_10_max_command / 2.0), 0, servo_10_max_command));
+  Target_position_servo_1 = (int)(constrain(steps_for_full_rotation_servo_1/FULLROTATION * actuators_t4_in.servo_1_cmd / (degrees_accuracy_multiplier) + (servo_1_max_command / 2.0), 0, servo_1_max_command));
+  Target_position_servo_2 = (int)(constrain(steps_for_full_rotation_servo_2/FULLROTATION * actuators_t4_in.servo_2_cmd / (degrees_accuracy_multiplier) + (servo_2_max_command / 2.0), 0, servo_2_max_command));
+  Target_position_servo_3 = (int)(constrain(steps_for_full_rotation_servo_3/FULLROTATION * actuators_t4_in.servo_3_cmd / (degrees_accuracy_multiplier) + (servo_3_max_command / 2.0), 0, servo_3_max_command));
+  Target_position_servo_4 = (int)(constrain(steps_for_full_rotation_servo_4/FULLROTATION * actuators_t4_in.servo_4_cmd / (degrees_accuracy_multiplier) + (servo_4_max_command / 2.0), 0, servo_4_max_command));
+  Target_position_servo_5 = (int)(constrain(steps_for_full_rotation_servo_5/FULLROTATION * actuators_t4_in.servo_5_cmd / (degrees_accuracy_multiplier) + (servo_5_max_command / 2.0), 0, servo_5_max_command));
+  Target_position_servo_6 = (int)(constrain(steps_for_full_rotation_servo_6/FULLROTATION * actuators_t4_in.servo_6_cmd / (degrees_accuracy_multiplier) + (servo_6_max_command / 2.0), 0, servo_6_max_command));
+  Target_position_servo_7 = (int)(constrain(steps_for_full_rotation_servo_7/FULLROTATION * actuators_t4_in.servo_7_cmd / (degrees_accuracy_multiplier) + (servo_7_max_command / 2.0), 0, servo_7_max_command));
+  Target_position_servo_8 = (int)(constrain(steps_for_full_rotation_servo_8/FULLROTATION * actuators_t4_in.servo_8_cmd / (degrees_accuracy_multiplier) + (servo_8_max_command / 2.0), 0, servo_8_max_command));
+  Target_position_servo_9 = (int)(constrain(steps_for_full_rotation_servo_9/FULLROTATION * actuators_t4_in.servo_9_cmd / (degrees_accuracy_multiplier) + (servo_9_max_command / 2.0), 0, servo_9_max_command));
+  Target_position_servo_10 = (int)(constrain(steps_for_full_rotation_servo_10/FULLROTATION * actuators_t4_in.servo_10_cmd / (degrees_accuracy_multiplier) + (servo_10_max_command / 2.0), 0, servo_10_max_command));
 
   /* ONLY Enable next line below for debugging purposes */
   //DEBUG_serial.println(Target_position_servo_1);
 
+  //Note that ESCCMD* starts at index Zero(0) and actuators_t4_in.esc_* starts at index One(1)
   if(ESC_1_arm){
     //Check if ESC telemetry has some errors, if so try to disarm and rearm the ESC
-    if(myserial_act_t4_out.esc_1_error_code_int < 0 && restart_esc_0 < COMMON_TMR)
+    if(actuators_t4_out.esc_1_error_code < -9 || do_restart_esc_1)
     {
-      ESCCMD_throttle(0, 0);
+      ESCCMD_stop(0);
+      do_restart_esc_1 = true;
     }
     else{
-      ESCCMD_throttle(0, constrain(myserial_act_t4_in.esc_1_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
-      restart_esc_0 = 0;
+      ESCCMD_throttle(0, constrain(actuators_t4_in.esc_1_dshot_cmd, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      do_restart_esc_1 = false;
+      esc_1_restart_ctmr = 0;
+    }
+
+    if(esc_1_restart_ctmr > ESC_RESET_TIMER){
+      do_restart_esc_1 = false;
     }
   } 
   else{
@@ -547,34 +561,73 @@ void GenerateCommands(void){
   }
 
   if(ESC_2_arm){
-    ESCCMD_throttle(1, constrain(myserial_act_t4_in.esc_2_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+    if(actuators_t4_out.esc_2_error_code < -9 || do_restart_esc_2)
+    {
+      ESCCMD_stop(1);
+      do_restart_esc_2 = true;
+    }
+    else{
+      ESCCMD_throttle(1, constrain(actuators_t4_in.esc_2_dshot_cmd, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      do_restart_esc_2 = false;
+      esc_2_restart_ctmr = 0;
+    }
+
+    if(esc_2_restart_ctmr > ESC_RESET_TIMER){
+      do_restart_esc_2 = false;
+    }
   } 
-  else {
+  else{
     ESCCMD_stop(1);
   }
 
   if(ESC_3_arm){
-    ESCCMD_throttle(2, constrain(myserial_act_t4_in.esc_3_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+    if(actuators_t4_out.esc_3_error_code < -9 || do_restart_esc_3)
+    {
+      ESCCMD_stop(2);
+      do_restart_esc_3 = true;
+    }
+    else{
+      ESCCMD_throttle(2, constrain(actuators_t4_in.esc_3_dshot_cmd, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      do_restart_esc_3 = false;
+      esc_3_restart_ctmr = 0;
+    }
+
+    if(esc_3_restart_ctmr > ESC_RESET_TIMER){
+      do_restart_esc_3 = false;
+    }
   } 
-  else {
+  else{
     ESCCMD_stop(2);
   }
 
   if(ESC_4_arm){
-    ESCCMD_throttle(3, constrain(myserial_act_t4_in.esc_4_dshot_cmd_int, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
-  }
-  else {
+    if(actuators_t4_out.esc_4_error_code < -9 || do_restart_esc_4)
+    {
+      ESCCMD_stop(3);
+      do_restart_esc_4 = true;
+    }
+    else{
+      ESCCMD_throttle(3, constrain(actuators_t4_in.esc_4_dshot_cmd, MIN_DSHOT_CMD, MAX_DSHOT_CMD));
+      do_restart_esc_4 = false;
+      esc_4_restart_ctmr = 0;
+    }
+
+    if(esc_4_restart_ctmr > ESC_RESET_TIMER){
+      do_restart_esc_4 = false;
+    }
+  } 
+  else{
     ESCCMD_stop(3);
   }
-  
+ 
 }
 
 /* Parse the incoming message from Flightcontroller and assign them to local variables */
-void serial_act_t4_parse_msg_in(void) {
+void actuators_t4_parse_msg_in(void) {
 
   /* Copy received buffer to structure */
-  memmove(&myserial_act_t4_in, &serial_act_t4_msg_buf_in[1], sizeof(struct serial_act_t4_in) - 1);
-  extra_data_in[myserial_act_t4_in.rolling_msg_in_id] = myserial_act_t4_in.rolling_msg_in;
+  memmove(&actuators_t4_in, &actuators_t4_msg_buf_in[1], sizeof(struct ActuatorsT4In) - 1);
+  extra_data_in[actuators_t4_in.rolling_msg_in_id] = actuators_t4_in.rolling_msg_in;
 
   comm_refresh_frequency = extra_data_in[0];
   
@@ -634,10 +687,10 @@ void CollectEscTelem(void) {
   ESCCMD_read_rpm(1, &local_rpm2);
   ESCCMD_read_rpm(2, &local_rpm3);
   ESCCMD_read_rpm(3, &local_rpm4);
-  myserial_act_t4_internal.esc_1_rpm_int = (int16_t)(abs(local_rpm1 * 10));
-  myserial_act_t4_internal.esc_2_rpm_int = (int16_t)(abs(local_rpm2 * 10));
-  myserial_act_t4_internal.esc_3_rpm_int = (int16_t)(abs(local_rpm3 * 10));
-  myserial_act_t4_internal.esc_4_rpm_int = (int16_t)(abs(local_rpm4 * 10));
+  actuators_t4_local.esc_1_rpm = (int16_t)(abs(local_rpm1 * 10));
+  actuators_t4_local.esc_2_rpm = (int16_t)(abs(local_rpm2 * 10));
+  actuators_t4_local.esc_3_rpm = (int16_t)(abs(local_rpm3 * 10));
+  actuators_t4_local.esc_4_rpm = (int16_t)(abs(local_rpm4 * 10));
 
   /* ESC ERROR CODE */
   int8_t local_err1 = 0, local_err2 = 0, local_err3 = 0, local_err4 = 0;
@@ -645,10 +698,10 @@ void CollectEscTelem(void) {
   ESCCMD_read_err(1, &local_err2);
   ESCCMD_read_err(2, &local_err3);
   ESCCMD_read_err(3, &local_err4);
-  myserial_act_t4_internal.esc_1_error_code_int = (int16_t)(local_err1);
-  myserial_act_t4_internal.esc_2_error_code_int = (int16_t)(local_err2);
-  myserial_act_t4_internal.esc_3_error_code_int = (int16_t)(local_err3);
-  myserial_act_t4_internal.esc_4_error_code_int = (int16_t)(local_err4);
+  actuators_t4_local.esc_1_error_code = (int16_t)(local_err1);
+  actuators_t4_local.esc_2_error_code = (int16_t)(local_err2);
+  actuators_t4_local.esc_3_error_code = (int16_t)(local_err3);
+  actuators_t4_local.esc_4_error_code = (int16_t)(local_err4);
 
   /* ESC VOLTAGE */
   uint16_t local_volt1 = 0, local_volt2 = 0, local_volt3 = 0, local_volt4 = 0;
@@ -656,10 +709,10 @@ void CollectEscTelem(void) {
   ESCCMD_read_volt(1, &local_volt2);
   ESCCMD_read_volt(2, &local_volt3);
   ESCCMD_read_volt(3, &local_volt4);
-  myserial_act_t4_internal.esc_1_voltage_int = (int16_t)(local_volt1);
-  myserial_act_t4_internal.esc_2_voltage_int = (int16_t)(local_volt2);
-  myserial_act_t4_internal.esc_3_voltage_int = (int16_t)(local_volt3);
-  myserial_act_t4_internal.esc_4_voltage_int = (int16_t)(local_volt4);
+  actuators_t4_local.esc_1_voltage = (int16_t)(local_volt1);
+  actuators_t4_local.esc_2_voltage = (int16_t)(local_volt2);
+  actuators_t4_local.esc_3_voltage = (int16_t)(local_volt3);
+  actuators_t4_local.esc_4_voltage = (int16_t)(local_volt4);
 
   /* ESC CURRENT */
   uint16_t local_current1 = 0, local_current2 = 0, local_current3 = 0, local_current4 = 0;
@@ -667,10 +720,10 @@ void CollectEscTelem(void) {
   ESCCMD_read_amp(1, &local_current2);
   ESCCMD_read_amp(2, &local_current3);
   ESCCMD_read_amp(3, &local_current4);
-  myserial_act_t4_internal.esc_1_current_int = (int16_t)(local_current1);
-  myserial_act_t4_internal.esc_2_current_int = (int16_t)(local_current2);
-  myserial_act_t4_internal.esc_3_current_int = (int16_t)(local_current3);
-  myserial_act_t4_internal.esc_4_current_int = (int16_t)(local_current4);
+  actuators_t4_local.esc_1_current = (int16_t)(local_current1);
+  actuators_t4_local.esc_2_current = (int16_t)(local_current2);
+  actuators_t4_local.esc_3_current = (int16_t)(local_current3);
+  actuators_t4_local.esc_4_current = (int16_t)(local_current4);
 
   /* ESC Current CURRENT ;) consumption */
   uint16_t local_consumption1 = 0, local_consumption2 = 0, local_consumption3 = 0, local_consumption4 = 0;
@@ -678,10 +731,10 @@ void CollectEscTelem(void) {
   ESCCMD_read_mah(1, &local_consumption2);
   ESCCMD_read_mah(2, &local_consumption3);
   ESCCMD_read_mah(3, &local_consumption4);
-  myserial_act_t4_internal.esc_1_consumed_mAh_int = (int16_t)(local_consumption1);
-  myserial_act_t4_internal.esc_2_consumed_mAh_int = (int16_t)(local_consumption2);
-  myserial_act_t4_internal.esc_3_consumed_mAh_int = (int16_t)(local_consumption3);
-  myserial_act_t4_internal.esc_4_consumed_mAh_int = (int16_t)(local_consumption4);
+  actuators_t4_local.esc_1_consumed_mAh = (int16_t)(local_consumption1);
+  actuators_t4_local.esc_2_consumed_mAh = (int16_t)(local_consumption2);
+  actuators_t4_local.esc_3_consumed_mAh = (int16_t)(local_consumption3);
+  actuators_t4_local.esc_4_consumed_mAh = (int16_t)(local_consumption4);
 }
 
 /* Receive and send message from Flightcontroller */
@@ -693,163 +746,173 @@ void SendReceiveFlightcontroller(void) {
     /* Collect the ESC telemetry: */
     CollectEscTelem();
 
-    /* Fill the myserial_act_t4_out structure to be sent to the Flightcontroller: */
-    myserial_act_t4_out.esc_1_rpm_int = myserial_act_t4_internal.esc_1_rpm_int;
-    myserial_act_t4_out.esc_2_rpm_int = myserial_act_t4_internal.esc_2_rpm_int;
-    myserial_act_t4_out.esc_3_rpm_int = myserial_act_t4_internal.esc_3_rpm_int;
-    myserial_act_t4_out.esc_4_rpm_int = myserial_act_t4_internal.esc_4_rpm_int;
-    myserial_act_t4_out.esc_1_error_code_int = myserial_act_t4_internal.esc_1_error_code_int;
-    myserial_act_t4_out.esc_2_error_code_int = myserial_act_t4_internal.esc_2_error_code_int;
-    myserial_act_t4_out.esc_3_error_code_int = myserial_act_t4_internal.esc_3_error_code_int;
-    myserial_act_t4_out.esc_4_error_code_int = myserial_act_t4_internal.esc_4_error_code_int;
-    myserial_act_t4_out.esc_1_current_int = myserial_act_t4_internal.esc_1_current_int;
-    myserial_act_t4_out.esc_2_current_int = myserial_act_t4_internal.esc_2_current_int;
-    myserial_act_t4_out.esc_3_current_int = myserial_act_t4_internal.esc_3_current_int;
-    myserial_act_t4_out.esc_4_current_int = myserial_act_t4_internal.esc_4_current_int;
-    myserial_act_t4_out.esc_1_voltage_int = myserial_act_t4_internal.esc_1_voltage_int;
-    myserial_act_t4_out.esc_2_voltage_int = myserial_act_t4_internal.esc_2_voltage_int;
-    myserial_act_t4_out.esc_3_voltage_int = myserial_act_t4_internal.esc_3_voltage_int;
-    myserial_act_t4_out.esc_4_voltage_int = myserial_act_t4_internal.esc_4_voltage_int;
-    myserial_act_t4_out.servo_1_angle_int = myserial_act_t4_internal.servo_1_angle_int;
-    myserial_act_t4_out.servo_2_angle_int = myserial_act_t4_internal.servo_2_angle_int;
-    myserial_act_t4_out.servo_3_angle_int = myserial_act_t4_internal.servo_3_angle_int;
-    myserial_act_t4_out.servo_4_angle_int = myserial_act_t4_internal.servo_4_angle_int;
-    myserial_act_t4_out.servo_5_angle_int = myserial_act_t4_internal.servo_5_angle_int;
-    myserial_act_t4_out.servo_6_angle_int = myserial_act_t4_internal.servo_6_angle_int;
-    myserial_act_t4_out.servo_7_angle_int = myserial_act_t4_internal.servo_7_angle_int;
-    myserial_act_t4_out.servo_8_angle_int = myserial_act_t4_internal.servo_8_angle_int;
-    myserial_act_t4_out.servo_9_angle_int = myserial_act_t4_internal.servo_9_angle_int;
-    myserial_act_t4_out.servo_10_angle_int = myserial_act_t4_internal.servo_10_angle_int;
-    myserial_act_t4_out.servo_11_angle_int = myserial_act_t4_internal.servo_11_angle_int;
-    myserial_act_t4_out.servo_1_load_int = myserial_act_t4_internal.servo_1_load_int;
-    myserial_act_t4_out.servo_2_load_int = myserial_act_t4_internal.servo_2_load_int;
-    myserial_act_t4_out.servo_3_load_int = myserial_act_t4_internal.servo_3_load_int;
-    myserial_act_t4_out.servo_4_load_int = myserial_act_t4_internal.servo_4_load_int;
-    myserial_act_t4_out.servo_5_load_int = myserial_act_t4_internal.servo_5_load_int;
-    myserial_act_t4_out.servo_6_load_int = myserial_act_t4_internal.servo_6_load_int;
-    myserial_act_t4_out.servo_7_load_int = myserial_act_t4_internal.servo_7_load_int;
-    myserial_act_t4_out.servo_8_load_int = myserial_act_t4_internal.servo_8_load_int;
-    myserial_act_t4_out.servo_9_load_int = myserial_act_t4_internal.servo_9_load_int;
-    myserial_act_t4_out.servo_10_load_int = myserial_act_t4_internal.servo_10_load_int;
+    /* Fill the actuators_t4_out structure to be sent to the Flightcontroller: */
+    actuators_t4_out.esc_1_rpm = actuators_t4_local.esc_1_rpm;
+    actuators_t4_out.esc_2_rpm = actuators_t4_local.esc_2_rpm;
+    actuators_t4_out.esc_3_rpm = actuators_t4_local.esc_3_rpm;
+    actuators_t4_out.esc_4_rpm = actuators_t4_local.esc_4_rpm;
 
-    #define LOSTMAXIMUM 1000
+    actuators_t4_out.esc_1_error_code = actuators_t4_local.esc_1_error_code;
+    actuators_t4_out.esc_2_error_code = actuators_t4_local.esc_2_error_code;
+    actuators_t4_out.esc_3_error_code = actuators_t4_local.esc_3_error_code;
+    actuators_t4_out.esc_4_error_code = actuators_t4_local.esc_4_error_code;
+
+    actuators_t4_out.esc_1_current = actuators_t4_local.esc_1_current;
+    actuators_t4_out.esc_2_current = actuators_t4_local.esc_2_current;
+    actuators_t4_out.esc_3_current = actuators_t4_local.esc_3_current;
+    actuators_t4_out.esc_4_current = actuators_t4_local.esc_4_current;
+
+    actuators_t4_out.esc_1_voltage = actuators_t4_local.esc_1_voltage;
+    actuators_t4_out.esc_2_voltage = actuators_t4_local.esc_2_voltage;
+    actuators_t4_out.esc_3_voltage = actuators_t4_local.esc_3_voltage;
+    actuators_t4_out.esc_4_voltage = actuators_t4_local.esc_4_voltage;
+
+    actuators_t4_out.servo_1_angle = actuators_t4_local.servo_1_angle;
+    actuators_t4_out.servo_2_angle = actuators_t4_local.servo_2_angle;
+    actuators_t4_out.servo_3_angle = actuators_t4_local.servo_3_angle;
+    actuators_t4_out.servo_4_angle = actuators_t4_local.servo_4_angle;
+    actuators_t4_out.servo_5_angle = actuators_t4_local.servo_5_angle;
+    actuators_t4_out.servo_6_angle = actuators_t4_local.servo_6_angle;
+    actuators_t4_out.servo_7_angle = actuators_t4_local.servo_7_angle;
+    actuators_t4_out.servo_8_angle = actuators_t4_local.servo_8_angle;
+    actuators_t4_out.servo_9_angle = actuators_t4_local.servo_9_angle;
+    actuators_t4_out.servo_10_angle = actuators_t4_local.servo_10_angle;
+    actuators_t4_out.servo_11_angle = actuators_t4_local.servo_11_angle;
+
+    actuators_t4_out.servo_1_load = actuators_t4_local.servo_1_load;
+    actuators_t4_out.servo_2_load = actuators_t4_local.servo_2_load;
+    actuators_t4_out.servo_3_load = actuators_t4_local.servo_3_load;
+    actuators_t4_out.servo_4_load = actuators_t4_local.servo_4_load;
+    actuators_t4_out.servo_5_load = actuators_t4_local.servo_5_load;
+    actuators_t4_out.servo_6_load = actuators_t4_local.servo_6_load;
+    actuators_t4_out.servo_7_load = actuators_t4_local.servo_7_load;
+    actuators_t4_out.servo_8_load = actuators_t4_local.servo_8_load;
+    actuators_t4_out.servo_9_load = actuators_t4_local.servo_9_load;
+    actuators_t4_out.servo_10_load = actuators_t4_local.servo_10_load;
+
+    #define LOSTMAXIMUM 1000 // Maximum lost time to consider the servo as lost
 
     /* Generate the bitmask for the health of the servos, based on the feedback update time: */
-    if (myserial_act_t4_internal.servo_1_feedback_update_time_us < COMMON_TMR && feedback_servo_1_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 0;
+    if (actuators_t4_local.servo_1_feedback_update_time_us < COMMON_TMR && feedback_servo_1_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 0;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 0); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 0); 
     }
 
-    if (myserial_act_t4_internal.servo_2_feedback_update_time_us < COMMON_TMR && feedback_servo_2_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 1;
+    if (actuators_t4_local.servo_2_feedback_update_time_us < COMMON_TMR && feedback_servo_2_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 1;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 1); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 1); 
     }
 
-    if (myserial_act_t4_internal.servo_3_feedback_update_time_us < COMMON_TMR && feedback_servo_3_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 2;
+    if (actuators_t4_local.servo_3_feedback_update_time_us < COMMON_TMR && feedback_servo_3_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 2;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 2); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 2); 
     }
 
-    if (myserial_act_t4_internal.servo_4_feedback_update_time_us < COMMON_TMR && feedback_servo_4_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 3;
+    if (actuators_t4_local.servo_4_feedback_update_time_us < COMMON_TMR && feedback_servo_4_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 3;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 3); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 3); 
     }
 
-    if (myserial_act_t4_internal.servo_5_feedback_update_time_us < COMMON_TMR && feedback_servo_5_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 4;
+    if (actuators_t4_local.servo_5_feedback_update_time_us < COMMON_TMR && feedback_servo_5_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 4;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 4); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 4); 
     }
 
-    if (myserial_act_t4_internal.servo_6_feedback_update_time_us < COMMON_TMR && feedback_servo_6_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 5;
+    if (actuators_t4_local.servo_6_feedback_update_time_us < COMMON_TMR && feedback_servo_6_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 5;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 5); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 5); 
     }
 
-    if (myserial_act_t4_internal.servo_7_feedback_update_time_us < COMMON_TMR && feedback_servo_7_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 6;
+    if (actuators_t4_local.servo_7_feedback_update_time_us < COMMON_TMR && feedback_servo_7_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 6;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 6); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 6); 
     }
 
-    if (myserial_act_t4_internal.servo_8_feedback_update_time_us < COMMON_TMR && feedback_servo_8_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 7;
+    if (actuators_t4_local.servo_8_feedback_update_time_us < COMMON_TMR && feedback_servo_8_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 7;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 7); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 7); 
     }
 
-    if (myserial_act_t4_internal.servo_9_feedback_update_time_us < COMMON_TMR && feedback_servo_9_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 8;
+    if (actuators_t4_local.servo_9_feedback_update_time_us < COMMON_TMR && feedback_servo_9_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 8;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 8); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 8); 
     }
 
-    if (myserial_act_t4_internal.servo_10_feedback_update_time_us < COMMON_TMR && feedback_servo_10_lost < LOSTMAXIMUM){
-      myserial_act_t4_out.bitmask_servo_health |= 1 << 9;
+    if (actuators_t4_local.servo_10_feedback_update_time_us < COMMON_TMR && feedback_servo_10_lost < LOSTMAXIMUM){
+      actuators_t4_out.bitmask_servo_health |= 1 << 9;
     }
     else { 
-      myserial_act_t4_out.bitmask_servo_health &= ~(1 << 9); 
+      actuators_t4_out.bitmask_servo_health &= ~(1 << 9); 
     }
     
     /* Fill the extra data to be sent to the Flightcontroller: */
-    extra_data_out[0] = (float) myserial_act_t4_internal.esc_1_consumed_mAh_int; 
-    extra_data_out[1] = (float) myserial_act_t4_internal.esc_2_consumed_mAh_int;
-    extra_data_out[2] = (float) myserial_act_t4_internal.esc_3_consumed_mAh_int;
-    extra_data_out[3] = (float) myserial_act_t4_internal.esc_4_consumed_mAh_int;
-    extra_data_out[4] = (float) myserial_act_t4_internal.servo_1_speed_int; 
-    extra_data_out[5] = (float) myserial_act_t4_internal.servo_2_speed_int;
-    extra_data_out[6] = (float) myserial_act_t4_internal.servo_3_speed_int;
-    extra_data_out[7] = (float) myserial_act_t4_internal.servo_4_speed_int;
-    extra_data_out[8] = (float) myserial_act_t4_internal.servo_5_speed_int;
-    extra_data_out[9] = (float) myserial_act_t4_internal.servo_6_speed_int;
-    extra_data_out[10] = (float) myserial_act_t4_internal.servo_7_speed_int;
-    extra_data_out[11] = (float) myserial_act_t4_internal.servo_8_speed_int;
-    extra_data_out[12] = (float) myserial_act_t4_internal.servo_9_speed_int;
-    extra_data_out[13] = (float) myserial_act_t4_internal.servo_10_speed_int;
-    extra_data_out[14] = (float) myserial_act_t4_internal.servo_1_volt_int;
-    extra_data_out[15] = (float) myserial_act_t4_internal.servo_2_volt_int;
-    extra_data_out[16] = (float) myserial_act_t4_internal.servo_3_volt_int;
-    extra_data_out[17] = (float) myserial_act_t4_internal.servo_4_volt_int;
-    extra_data_out[18] = (float) myserial_act_t4_internal.servo_5_volt_int;
-    extra_data_out[19] = (float) myserial_act_t4_internal.servo_6_volt_int;
-    extra_data_out[20] = (float) myserial_act_t4_internal.servo_7_volt_int;
-    extra_data_out[21] = (float) myserial_act_t4_internal.servo_8_volt_int;
-    extra_data_out[22] = (float) myserial_act_t4_internal.servo_9_volt_int;
-    extra_data_out[23] = (float) myserial_act_t4_internal.servo_10_volt_int;
-    extra_data_out[24] = (float) myserial_act_t4_internal.servo_1_temp_int;
-    extra_data_out[25] = (float) myserial_act_t4_internal.servo_2_temp_int;
-    extra_data_out[26] = (float) myserial_act_t4_internal.servo_3_temp_int;
-    extra_data_out[27] = (float) myserial_act_t4_internal.servo_4_temp_int;
-    extra_data_out[28] = (float) myserial_act_t4_internal.servo_5_temp_int;
-    extra_data_out[29] = (float) myserial_act_t4_internal.servo_6_temp_int;
-    extra_data_out[30] = (float) myserial_act_t4_internal.servo_7_temp_int;
-    extra_data_out[31] = (float) myserial_act_t4_internal.servo_8_temp_int;
-    extra_data_out[32] = (float) myserial_act_t4_internal.servo_9_temp_int;
-    extra_data_out[33] = (float) myserial_act_t4_internal.servo_10_temp_int;
-    extra_data_out[34] = (float) myserial_act_t4_internal.servo_1_feedback_update_time_us;
-    extra_data_out[35] = (float) myserial_act_t4_internal.servo_2_feedback_update_time_us;
-    extra_data_out[36] = (float) myserial_act_t4_internal.servo_3_feedback_update_time_us;
-    extra_data_out[37] = (float) myserial_act_t4_internal.servo_4_feedback_update_time_us;
-    extra_data_out[38] = (float) myserial_act_t4_internal.servo_5_feedback_update_time_us;
-    extra_data_out[39] = (float) myserial_act_t4_internal.servo_6_feedback_update_time_us;
-    extra_data_out[40] = (float) myserial_act_t4_internal.servo_7_feedback_update_time_us;
-    extra_data_out[41] = (float) myserial_act_t4_internal.servo_8_feedback_update_time_us;
-    extra_data_out[42] = (float) myserial_act_t4_internal.servo_9_feedback_update_time_us;
-    extra_data_out[43] = (float) myserial_act_t4_internal.servo_10_feedback_update_time_us;
+    extra_data_out[0] = (float) actuators_t4_local.esc_1_consumed_mAh; 
+    extra_data_out[1] = (float) actuators_t4_local.esc_2_consumed_mAh;
+    extra_data_out[2] = (float) actuators_t4_local.esc_3_consumed_mAh;
+    extra_data_out[3] = (float) actuators_t4_local.esc_4_consumed_mAh;
+
+    extra_data_out[4] = (float) actuators_t4_local.servo_1_speed; 
+    extra_data_out[5] = (float) actuators_t4_local.servo_2_speed;
+    extra_data_out[6] = (float) actuators_t4_local.servo_3_speed;
+    extra_data_out[7] = (float) actuators_t4_local.servo_4_speed;
+    extra_data_out[8] = (float) actuators_t4_local.servo_5_speed;
+    extra_data_out[9] = (float) actuators_t4_local.servo_6_speed;
+    extra_data_out[10] = (float) actuators_t4_local.servo_7_speed;
+    extra_data_out[11] = (float) actuators_t4_local.servo_8_speed;
+    extra_data_out[12] = (float) actuators_t4_local.servo_9_speed;
+    extra_data_out[13] = (float) actuators_t4_local.servo_10_speed;
+
+    extra_data_out[14] = (float) actuators_t4_local.servo_1_volt;
+    extra_data_out[15] = (float) actuators_t4_local.servo_2_volt;
+    extra_data_out[16] = (float) actuators_t4_local.servo_3_volt;
+    extra_data_out[17] = (float) actuators_t4_local.servo_4_volt;
+    extra_data_out[18] = (float) actuators_t4_local.servo_5_volt;
+    extra_data_out[19] = (float) actuators_t4_local.servo_6_volt;
+    extra_data_out[20] = (float) actuators_t4_local.servo_7_volt;
+    extra_data_out[21] = (float) actuators_t4_local.servo_8_volt;
+    extra_data_out[22] = (float) actuators_t4_local.servo_9_volt;
+    extra_data_out[23] = (float) actuators_t4_local.servo_10_volt;
+
+    extra_data_out[24] = (float) actuators_t4_local.servo_1_temp;
+    extra_data_out[25] = (float) actuators_t4_local.servo_2_temp;
+    extra_data_out[26] = (float) actuators_t4_local.servo_3_temp;
+    extra_data_out[27] = (float) actuators_t4_local.servo_4_temp;
+    extra_data_out[28] = (float) actuators_t4_local.servo_5_temp;
+    extra_data_out[29] = (float) actuators_t4_local.servo_6_temp;
+    extra_data_out[30] = (float) actuators_t4_local.servo_7_temp;
+    extra_data_out[31] = (float) actuators_t4_local.servo_8_temp;
+    extra_data_out[32] = (float) actuators_t4_local.servo_9_temp;
+    extra_data_out[33] = (float) actuators_t4_local.servo_10_temp;
+
+    extra_data_out[34] = (float) actuators_t4_local.servo_1_feedback_update_time_us;
+    extra_data_out[35] = (float) actuators_t4_local.servo_2_feedback_update_time_us;
+    extra_data_out[36] = (float) actuators_t4_local.servo_3_feedback_update_time_us;
+    extra_data_out[37] = (float) actuators_t4_local.servo_4_feedback_update_time_us;
+    extra_data_out[38] = (float) actuators_t4_local.servo_5_feedback_update_time_us;
+    extra_data_out[39] = (float) actuators_t4_local.servo_6_feedback_update_time_us;
+    extra_data_out[40] = (float) actuators_t4_local.servo_7_feedback_update_time_us;
+    extra_data_out[41] = (float) actuators_t4_local.servo_8_feedback_update_time_us;
+    extra_data_out[42] = (float) actuators_t4_local.servo_9_feedback_update_time_us;
+    extra_data_out[43] = (float) actuators_t4_local.servo_10_feedback_update_time_us;
+
     extra_data_out[44] = (float) feedback_servo_1_lost; 
     extra_data_out[45] = (float) feedback_servo_2_lost;
     extra_data_out[46] = (float) feedback_servo_3_lost;
@@ -860,6 +923,7 @@ void SendReceiveFlightcontroller(void) {
     extra_data_out[51] = (float) feedback_servo_8_lost;
     extra_data_out[52] = (float) feedback_servo_9_lost;
     extra_data_out[53] = (float) feedback_servo_10_lost;
+
     extra_data_out[54] = (float) position_ack_servo_1_lost; 
     extra_data_out[55] = (float) position_ack_servo_2_lost;
     extra_data_out[56] = (float) position_ack_servo_3_lost;
@@ -872,21 +936,21 @@ void SendReceiveFlightcontroller(void) {
     extra_data_out[63] = (float) position_ack_servo_10_lost;
 
     /* Assign rolling message: */
-    myserial_act_t4_out.rolling_msg_out = extra_data_out[rolling_message_out_id_cnt];
-    myserial_act_t4_out.rolling_msg_out_id = rolling_message_out_id_cnt;
+    actuators_t4_out.rolling_msg_out = extra_data_out[rolling_message_out_id_cnt];
+    actuators_t4_out.rolling_msg_out_id = rolling_message_out_id_cnt;
     rolling_message_out_id_cnt++;
     if (rolling_message_out_id_cnt > 63) rolling_message_out_id_cnt = 0;
 
     /* Calculate checksum for outbound packet: */
-    uint8_t* buf_send = (uint8_t*)&myserial_act_t4_out;
-    myserial_act_t4_out.checksum_out = 0;
-    for (uint16_t i = 0; i < sizeof(struct serial_act_t4_out) - 1; i++) {
-      myserial_act_t4_out.checksum_out += buf_send[i];
+    uint8_t* buf_send = (uint8_t*)&actuators_t4_out;
+    actuators_t4_out.checksum_out = 0;
+    for (uint16_t i = 0; i < sizeof(struct ActuatorsT4Out) - 1; i++) {
+      actuators_t4_out.checksum_out += buf_send[i];
     }
 
     /* Send out packet to buffer: */
-    COMMUNICATION_SERIAL.write(START_BYTE_SERIAL_ACT_T4);
-    COMMUNICATION_SERIAL.write(buf_send, sizeof(struct serial_act_t4_out));
+    COMMUNICATION_SERIAL.write(START_BYTE_ACTUATORS_T4);
+    COMMUNICATION_SERIAL.write(buf_send, sizeof(struct ActuatorsT4Out));
 
     ack_comm_TX_flightcontroller = 1;
     last_time_write_to_flightcontroller = 0;
@@ -895,40 +959,40 @@ void SendReceiveFlightcontroller(void) {
   /* RECEIVING PACKET */
   /* Reset received packets to zero every 5 second to update the statistics */
   if (old_time_frequency_in > COMMON_TMR) {
-    serial_act_t4_received_packets = 0;
+    actuators_t4_received_packets = 0;
     old_time_frequency_in = 0;
   }
 
   /* Collect packets on the buffer if available: */
   while (COMMUNICATION_SERIAL.available()) {
-    uint8_t serial_act_t4_byte_in;
-    serial_act_t4_byte_in = COMMUNICATION_SERIAL.read();
-    if ((serial_act_t4_byte_in == START_BYTE_SERIAL_ACT_T4) || (serial_act_t4_buf_in_cnt > 0)) {
-      serial_act_t4_msg_buf_in[serial_act_t4_buf_in_cnt] = serial_act_t4_byte_in;
-      serial_act_t4_buf_in_cnt++;
+    uint8_t actuators_t4_byte_in;
+    actuators_t4_byte_in = COMMUNICATION_SERIAL.read();
+    if ((actuators_t4_byte_in == START_BYTE_ACTUATORS_T4) || (actuators_t4_buf_in_cnt > 0)) {
+      actuators_t4_msg_buf_in[actuators_t4_buf_in_cnt] = actuators_t4_byte_in;
+      actuators_t4_buf_in_cnt++;
     }
 
-    if (serial_act_t4_buf_in_cnt > sizeof(struct serial_act_t4_in)) {
-      serial_act_t4_buf_in_cnt = 0;
+    if (actuators_t4_buf_in_cnt > sizeof(struct ActuatorsT4In)) {
+      actuators_t4_buf_in_cnt = 0;
       uint8_t checksum_in_local = 0;
-      for (uint16_t i = 1; i < sizeof(struct serial_act_t4_in); i++) {
-        checksum_in_local += serial_act_t4_msg_buf_in[i];
+      for (uint16_t i = 1; i < sizeof(struct ActuatorsT4In); i++) {
+        checksum_in_local += actuators_t4_msg_buf_in[i];
       }
 
-      if (checksum_in_local == serial_act_t4_msg_buf_in[sizeof(struct serial_act_t4_in)]) {
-        serial_act_t4_parse_msg_in();
-        serial_act_t4_received_packets++;
+      if (checksum_in_local == actuators_t4_msg_buf_in[sizeof(struct ActuatorsT4In)]) {
+        actuators_t4_parse_msg_in();
+        actuators_t4_received_packets++;
         time_no_connection_flightcontroller = 0;
       }
       else {
-        serial_act_t4_missed_packets_in++;
+        actuators_t4_missed_packets_in++;
       }
     }
   }
 
-  serial_act_t4_message_frequency_in = (uint16_t)((1.0 * serial_act_t4_received_packets / (old_time_frequency_in)) * 1000.0);
+  actuators_t4_message_frequency_in = (uint16_t)((1.0 * actuators_t4_received_packets / (old_time_frequency_in)) * 1000.0);
   /* Write the frequency to the status led: */
-  analogWrite(PIN_LED_T4, serial_act_t4_message_frequency_in * 3);
+  analogWrite(PIN_LED_T4, actuators_t4_message_frequency_in * 3);
 }
 
 /* Servo routine to be run inside the main loop */
@@ -960,20 +1024,20 @@ void writeEstimatePwmServos(void) {
   /* Apply the pwm values to the servos: */
   int servo11_PWM_value = SERVO_11_ZERO_PWM;
 
-  if (myserial_act_t4_in.servo_11_cmd_int >= 0) {
-    servo11_PWM_value += (int)(((myserial_act_t4_in.servo_11_cmd_int / degrees_accuracy_multiplier) / SERVO_11_MAX_ANGLE_DEG) * (SERVO_11_MAX_PWM - SERVO_11_ZERO_PWM));
+  if (actuators_t4_in.servo_11_cmd >= 0) {
+    servo11_PWM_value += (int)(((actuators_t4_in.servo_11_cmd / degrees_accuracy_multiplier) / SERVO_11_MAX_ANGLE_DEG) * (SERVO_11_MAX_PWM - SERVO_11_ZERO_PWM));
   }
   else {
-    servo11_PWM_value += (int)(((myserial_act_t4_in.servo_11_cmd_int / degrees_accuracy_multiplier) / SERVO_11_MIN_ANGLE_DEG) * (SERVO_11_MIN_PWM - SERVO_11_ZERO_PWM));
+    servo11_PWM_value += (int)(((actuators_t4_in.servo_11_cmd / degrees_accuracy_multiplier) / SERVO_11_MIN_ANGLE_DEG) * (SERVO_11_MIN_PWM - SERVO_11_ZERO_PWM));
   }
 
   int servo12_PWM_value = SERVO_12_ZERO_PWM;
 
-  if (myserial_act_t4_in.servo_12_cmd_int >= 0) {
-    servo12_PWM_value += (int)(((myserial_act_t4_in.servo_12_cmd_int / degrees_accuracy_multiplier) / SERVO_12_MAX_ANGLE_DEG) * (SERVO_12_MAX_PWM - SERVO_12_ZERO_PWM));
+  if (actuators_t4_in.servo_12_cmd >= 0) {
+    servo12_PWM_value += (int)(((actuators_t4_in.servo_12_cmd / degrees_accuracy_multiplier) / SERVO_12_MAX_ANGLE_DEG) * (SERVO_12_MAX_PWM - SERVO_12_ZERO_PWM));
   }
   else {
-    servo12_PWM_value += (int)(((myserial_act_t4_in.servo_12_cmd_int / degrees_accuracy_multiplier) / SERVO_12_MIN_ANGLE_DEG) * (SERVO_12_MIN_PWM - SERVO_12_ZERO_PWM));
+    servo12_PWM_value += (int)(((actuators_t4_in.servo_12_cmd / degrees_accuracy_multiplier) / SERVO_12_MIN_ANGLE_DEG) * (SERVO_12_MIN_PWM - SERVO_12_ZERO_PWM));
   }
 
   /* Bound the PWM output: */
@@ -999,13 +1063,13 @@ void writeEstimatePwmServos(void) {
   Servo11_state = -SERVO_11_FIRST_ORD_DYN_DEN * Servo11_state_old + SERVO_11_FIRST_ORD_DYN_NUM * servo_11_state_memory[SERVO_STATE_MEM_BUF_SIZE - SERVO_11_DELAY_TS - 1];
   Servo11_state = constrain(Servo11_state, SERVO_11_MIN_ANGLE_DEG, SERVO_11_MAX_ANGLE_DEG);
   /* Assign servo 11 to telemetry back for the estimation: */
-  myserial_act_t4_internal.servo_11_angle_int = (int16_t)(Servo11_state * degrees_accuracy_multiplier);
+  actuators_t4_local.servo_11_angle = (int16_t)(Servo11_state * degrees_accuracy_multiplier);
 
   /* Servo 12 estimation */
   Servo12_state = -SERVO_12_FIRST_ORD_DYN_DEN * Servo12_state_old + SERVO_12_FIRST_ORD_DYN_NUM * servo_12_state_memory[SERVO_STATE_MEM_BUF_SIZE - SERVO_12_DELAY_TS - 1];
   Servo12_state = constrain(Servo12_state, SERVO_12_MIN_ANGLE_DEG, SERVO_12_MAX_ANGLE_DEG);
   /* Assign servo 12 to telemetry back for the estimation: */
-  myserial_act_t4_internal.servo_12_angle_int = (int16_t)(Servo12_state * degrees_accuracy_multiplier);
+  actuators_t4_local.servo_12_angle = (int16_t)(Servo12_state * degrees_accuracy_multiplier);
 
   /* Assign the memory variables: */
   Servo11_state_old = Servo11_state;
@@ -1015,8 +1079,8 @@ void writeEstimatePwmServos(void) {
     servo_12_state_memory[j - 1] = servo_12_state_memory[j];
   }
 
-  servo_11_state_memory[SERVO_STATE_MEM_BUF_SIZE - 1] = myserial_act_t4_in.servo_11_cmd_int / degrees_accuracy_multiplier;
-  servo_12_state_memory[SERVO_STATE_MEM_BUF_SIZE - 1] = myserial_act_t4_in.servo_12_cmd_int / degrees_accuracy_multiplier;
+  servo_11_state_memory[SERVO_STATE_MEM_BUF_SIZE - 1] = actuators_t4_in.servo_11_cmd / degrees_accuracy_multiplier;
+  servo_12_state_memory[SERVO_STATE_MEM_BUF_SIZE - 1] = actuators_t4_in.servo_12_cmd / degrees_accuracy_multiplier;
 
 }
 
@@ -1040,25 +1104,25 @@ void EscRoutine(void) {
 void DebugServoPosition(void) {
 
   DEBUG_serial.print("Servo_1_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_1_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_1_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_2_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_2_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_2_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_3_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_3_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_3_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_4_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_4_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_4_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_5_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_5_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_5_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_6_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_6_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_6_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_7_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_7_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_7_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_8_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_8_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_8_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_9_position_deg:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_9_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.print(actuators_t4_local.servo_9_angle / degrees_accuracy_multiplier);
   DEBUG_serial.print(",Servo_10_position_deg:");
-  DEBUG_serial.println(myserial_act_t4_internal.servo_10_angle_int / degrees_accuracy_multiplier);
+  DEBUG_serial.println(actuators_t4_local.servo_10_angle / degrees_accuracy_multiplier);
 }
 
 /* Debug the Ack received by the servos after we set a desired angle */
@@ -1117,25 +1181,25 @@ void DebugServoLostFeedbackPackets(void) {
 void DebugUpdateTimePosPackets(void) {
 
   DEBUG_serial.print("Pos_S1_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_1_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_1_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S2_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_2_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_2_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S3_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_3_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_3_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S4_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_4_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_4_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S5_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_5_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_5_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S6_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_6_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_6_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S7_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_7_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_7_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S8_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_8_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_8_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S9_time_update:");
-  DEBUG_serial.print(myserial_act_t4_internal.servo_9_feedback_update_time_us);
+  DEBUG_serial.print(actuators_t4_local.servo_9_feedback_update_time_us);
   DEBUG_serial.print(",Pos_S10_time_update:");
-  DEBUG_serial.println(myserial_act_t4_internal.servo_10_feedback_update_time_us);
+  DEBUG_serial.println(actuators_t4_local.servo_10_feedback_update_time_us);
 
 }
 
@@ -1143,9 +1207,9 @@ void DebugUpdateTimePosPackets(void) {
 void DebugConnection(void) {
 
   DEBUG_serial.print("Missed_packet:");
-  DEBUG_serial.print(serial_act_t4_missed_packets_in);
+  DEBUG_serial.print(actuators_t4_missed_packets_in);
   DEBUG_serial.print(",Frequency_in:");
-  DEBUG_serial.println(serial_act_t4_message_frequency_in);
+  DEBUG_serial.println(actuators_t4_message_frequency_in);
 
 }
 #endif //INCLUDE_DEBUGCODE
@@ -1600,37 +1664,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 5: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_5_feedback_update_time_us = (int16_t)feedback_5_time_uS_counter;
+      actuators_t4_local.servo_5_feedback_update_time_us = (int16_t)feedback_5_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_5_ID) {
 
         /* Position */
         if(servo_5_is_SCS){
-          myserial_act_t4_internal.servo_5_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_5_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_5);
+          actuators_t4_local.servo_5_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_5_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_5);
         }
         else {
-          myserial_act_t4_internal.servo_5_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_5_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_5);
+          actuators_t4_local.servo_5_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_5_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_5);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_5_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_5_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_5_speed_int *= -1;
+          actuators_t4_local.servo_5_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_5_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_5_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_5_load_int *= -1;
+          actuators_t4_local.servo_5_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_5_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_5_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_5_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_5_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_5_time_uS_counter = 0;
       }
@@ -1653,38 +1717,38 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 10: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_10_feedback_update_time_us = (int16_t)feedback_10_time_uS_counter;
+      actuators_t4_local.servo_10_feedback_update_time_us = (int16_t)feedback_10_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_10_ID) {
 
         /* Position */
         if(servo_10_is_SCS){
-          myserial_act_t4_internal.servo_10_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_10_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_10);
+          actuators_t4_local.servo_10_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_10_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_10);
         }
         else {
-          myserial_act_t4_internal.servo_10_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_10_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_10);
+          actuators_t4_local.servo_10_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_10_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_10);
         }
 
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_10_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_10_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_10_speed_int *= -1;
+          actuators_t4_local.servo_10_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_10_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_10_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_10_load_int *= -1;
+          actuators_t4_local.servo_10_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_10_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_10_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_10_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_10_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_10_time_uS_counter = 0;
       }
@@ -2193,37 +2257,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 1: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_1_feedback_update_time_us = (int16_t)feedback_1_time_uS_counter;
+      actuators_t4_local.servo_1_feedback_update_time_us = (int16_t)feedback_1_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_1_ID) {
 
         /* Position */
         if(servo_1_is_SCS){
-          myserial_act_t4_internal.servo_1_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_1_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_1);
+          actuators_t4_local.servo_1_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_1_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_1);
         }
         else {
-          myserial_act_t4_internal.servo_1_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_1_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_1);
+          actuators_t4_local.servo_1_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_1_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_1);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_1_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_1_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_1_speed_int *= -1;
+          actuators_t4_local.servo_1_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_1_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_1_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_1_load_int *= -1;
+          actuators_t4_local.servo_1_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_1_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_1_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_1_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_1_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_1_time_uS_counter = 0;
       } 
@@ -2246,37 +2310,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 6: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_6_feedback_update_time_us = (int16_t)feedback_6_time_uS_counter;
+      actuators_t4_local.servo_6_feedback_update_time_us = (int16_t)feedback_6_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_6_ID) {
 
         /* Position */
         if(servo_6_is_SCS){
-          myserial_act_t4_internal.servo_6_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_6_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_6);
+          actuators_t4_local.servo_6_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_6_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_6);
         }
         else {
-          myserial_act_t4_internal.servo_6_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_6_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_6);
+          actuators_t4_local.servo_6_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_6_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_6);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_6_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_6_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_6_speed_int *= -1;
+          actuators_t4_local.servo_6_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_6_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_6_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_6_load_int *= -1;
+          actuators_t4_local.servo_6_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_6_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_6_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_6_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_6_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_6_time_uS_counter = 0;
       } 
@@ -2313,37 +2377,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 2: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_2_feedback_update_time_us = (int16_t)feedback_2_time_uS_counter;
+      actuators_t4_local.servo_2_feedback_update_time_us = (int16_t)feedback_2_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_2_ID) {
 
         /* Position */
         if(servo_2_is_SCS){
-          myserial_act_t4_internal.servo_2_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_2_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_2);
+          actuators_t4_local.servo_2_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_2_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_2);
         }
         else {
-          myserial_act_t4_internal.servo_2_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_2_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_2);
+          actuators_t4_local.servo_2_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_2_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_2);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_2_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_2_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_2_speed_int *= -1;
+          actuators_t4_local.servo_2_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_2_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_2_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_2_load_int *= -1;
+          actuators_t4_local.servo_2_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_2_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_2_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_2_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_2_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_2_time_uS_counter = 0;
       }
@@ -2366,37 +2430,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 7: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_7_feedback_update_time_us = (int16_t)feedback_7_time_uS_counter;
+      actuators_t4_local.servo_7_feedback_update_time_us = (int16_t)feedback_7_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_7_ID) {
 
         /* Position */
         if(servo_7_is_SCS){
-          myserial_act_t4_internal.servo_7_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_7_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_7);
+          actuators_t4_local.servo_7_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_7_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_7);
         }
         else {
-          myserial_act_t4_internal.servo_7_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_7_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_7);
+          actuators_t4_local.servo_7_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_7_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_7);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_7_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_7_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_7_speed_int *= -1;
+          actuators_t4_local.servo_7_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_7_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_7_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_7_load_int *= -1;
+          actuators_t4_local.servo_7_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_7_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_7_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_7_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_7_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_7_time_uS_counter = 0;
       }
@@ -2433,37 +2497,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 3: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_3_feedback_update_time_us = (int16_t)feedback_3_time_uS_counter;
+      actuators_t4_local.servo_3_feedback_update_time_us = (int16_t)feedback_3_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_3_ID) {
 
         /* Position */
         if(servo_3_is_SCS){
-          myserial_act_t4_internal.servo_3_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_3_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_3);
+          actuators_t4_local.servo_3_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_3_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_3);
         }
         else {
-          myserial_act_t4_internal.servo_3_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_3_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_3);
+          actuators_t4_local.servo_3_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_3_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_3);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_3_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_3_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_3_speed_int *= -1;
+          actuators_t4_local.servo_3_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_3_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_3_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_3_load_int *= -1;
+          actuators_t4_local.servo_3_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_3_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_3_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_3_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_3_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_3_time_uS_counter = 0;
       }
@@ -2486,37 +2550,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 8: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_8_feedback_update_time_us = (int16_t)feedback_8_time_uS_counter;
+      actuators_t4_local.servo_8_feedback_update_time_us = (int16_t)feedback_8_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_8_ID) {
 
         /* Position */
         if(servo_8_is_SCS){
-          myserial_act_t4_internal.servo_8_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_8_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_8);
+          actuators_t4_local.servo_8_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_8_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_8);
         }
         else {
-          myserial_act_t4_internal.servo_8_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_8_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_8);
+          actuators_t4_local.servo_8_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_8_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_8);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_8_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_8_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_8_speed_int *= -1;
+          actuators_t4_local.servo_8_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_8_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_8_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_8_load_int *= -1;
+          actuators_t4_local.servo_8_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_8_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_8_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_8_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_8_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_8_time_uS_counter = 0;
       }
@@ -2553,37 +2617,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 4: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_4_feedback_update_time_us = (int16_t)feedback_4_time_uS_counter;
+      actuators_t4_local.servo_4_feedback_update_time_us = (int16_t)feedback_4_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_4_ID) {
 
         /* Position */
         if(servo_4_is_SCS){
-          myserial_act_t4_internal.servo_4_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_4_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_4);
+          actuators_t4_local.servo_4_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_4_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_4);
         }
         else {
-          myserial_act_t4_internal.servo_4_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_4_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_4);
+          actuators_t4_local.servo_4_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_4_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_4);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_4_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_4_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_4_speed_int *= -1;
+          actuators_t4_local.servo_4_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_4_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_4_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_4_load_int *= -1;
+          actuators_t4_local.servo_4_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_4_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_4_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_4_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_4_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_4_time_uS_counter = 0;
       }
@@ -2606,37 +2670,37 @@ void writeReadServos(void) {
       #ifdef VERBOSE_MESSAGE
             PrintHex("Instruction received from servo 9: ", &buffer_servo[0], buffer_servo_idx);
       #endif
-      myserial_act_t4_internal.servo_9_feedback_update_time_us = (int16_t)feedback_9_time_uS_counter;
+      actuators_t4_local.servo_9_feedback_update_time_us = (int16_t)feedback_9_time_uS_counter;
       if (255 - bitsum_servo == buffer_servo[13] && buffer_servo[2] == Servo_9_ID) {
 
         /* Position */
         if(servo_9_is_SCS){
-          myserial_act_t4_internal.servo_9_angle_int = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_9_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_9);
+          actuators_t4_local.servo_9_angle = (int16_t)((CompactBytes(buffer_servo[5], buffer_servo[6]) - servo_9_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_9);
         }
         else {
-          myserial_act_t4_internal.servo_9_angle_int = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_9_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_9);
+          actuators_t4_local.servo_9_angle = (int16_t)((CompactBytes(buffer_servo[6], buffer_servo[5]) - servo_9_max_command/2) * (360*degrees_accuracy_multiplier) / steps_for_full_rotation_servo_9);
         }
         /* Speed */
         int sign = bitRead(buffer_servo[8], 7);
         bitClear(buffer_servo[8], 7);
-        myserial_act_t4_internal.servo_9_speed_int = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
+        actuators_t4_local.servo_9_speed = (int16_t)((CompactBytes(buffer_servo[8], buffer_servo[7])));
         if (sign) {
-          myserial_act_t4_internal.servo_9_speed_int *= -1;
+          actuators_t4_local.servo_9_speed *= -1;
         }
 
         /* Load */
         sign = bitRead(buffer_servo[10], 2);
         bitClear(buffer_servo[10], 2);
-        myserial_act_t4_internal.servo_9_load_int = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
+        actuators_t4_local.servo_9_load = (int16_t)((CompactBytes(buffer_servo[10], buffer_servo[9])));
         if (sign) {
-          myserial_act_t4_internal.servo_9_load_int *= -1;
+          actuators_t4_local.servo_9_load *= -1;
         }
 
         /* Voltage */
-        myserial_act_t4_internal.servo_9_volt_int = (int16_t)(buffer_servo[11]);
+        actuators_t4_local.servo_9_volt = (int16_t)(buffer_servo[11]);
 
         /* Temperature */
-        myserial_act_t4_internal.servo_9_temp_int = (int16_t)(buffer_servo[12]); 
+        actuators_t4_local.servo_9_temp = (int16_t)(buffer_servo[12]); 
                
         feedback_9_time_uS_counter = 0;
       }
