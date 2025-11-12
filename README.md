@@ -12,7 +12,14 @@ Servos can be controlled in both Serial Mode as well as PWM mode. For the servo 
 Note that it is very well possible to use another MCU, the MCU used on this PCB offered a swift and relatively cheap way to a robust solution.
 
 # Firmware
-To compile the Firmware that needs to be flashed to a T4-Board one needs to [install Arduino IDE and Teensy support via instruction follow this link](https://www.pjrc.com/teensy/td_download.html). We used, and had great success with, v1.8.19. It is well possible a newer version even works, we did't try.
+To compile the Firmware that needs to be flashed to a T4-Board one needs to [install Arduino IDE and Teensy support via instruction follow this link](https://www.pjrc.com/teensy/td_download.html). We used, and had great success with, v1.8.19. It is well possible a newer version even works, we did't try. And if you are not reading the docs yet, and installed 1.59.0, well you have to change line 49 in ESCCMD.cpp 
+
+from:
+HardwareSerial*     ESCCMD_serial[ESCCMD_NB_UART] = {       // Array of Serial objects
+
+to:
+HardwareSerialIMXRT*     ESCCMD_serial[ESCCMD_NB_UART] = {       // Array of Serial objects
+
 
 # Real-life use
 The [Paparazzi UAV Autopilot stack](https://wiki.paparazziuav.org/) is already flying around using this solution, see [Paparazzi UAV with T4-Board](https://wiki.paparazziuav.org/) 
